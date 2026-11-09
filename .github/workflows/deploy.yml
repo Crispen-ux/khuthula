@@ -1,0 +1,100 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        default: production
+        type: choice
+        options: [staging, production]
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Lint
+        run: npm run lint
+
+      - name: TypeScript check
+        run: npx tsc --noEmit
+
+      - name: Build static export
+        run: npm run build
+
+      - name: Verify out directory
+        run: |
+          test -d out
+          test -f out/index.html
+          test -f out/contact/index.html
+
+      - name: Setup SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -p "${SSH_PORT:-22}" "${SSH_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Deploy static site
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
+          REMOTE_PATH: ${{ secrets.REMOTE_PATH }}
+        run: |
+          rsync -avz --delete \
+            --exclude='api/config.php' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            -e "ssh -p ${SSH_PORT:-22}" \
+            out/ "${SSH_USERNAME}@${SSH_HOST}:${REMOTE_PATH}/"
+
+      - name: Deploy PHP endpoint
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
+          REMOTE_PATH: ${{ secrets.REMOTE_PATH }}
+        run: |
+          ssh -p "${SSH_PORT:-22}" "${SSH_USERNAME}@${SSH_HOST}" "mkdir -p ${REMOTE_PATH}/api"
+          rsync -avz \
+            -e "ssh -p ${SSH_PORT:-22}" \
+            php/lead.php "${SSH_USERNAME}@${SSH_HOST}:${REMOTE_PATH}/api/lead.php"
+
+      - name: Verify deployment
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: |
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "${SITE_URL}")
+            echo "Attempt $i: HTTP $code"
+            if [ "$code" = "200" ]; then exit 0; fi
+            sleep 5
+          done
+          exit 1
+
+      # Rollback hook (manual): keep previous release artifact or git SHA to restore.
+      # Introduce a versioned release directory and symlink swap for zero-downtime rollback.
